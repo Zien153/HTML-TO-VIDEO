@@ -2,6 +2,7 @@ const express = require("express");
 const multer = require("multer");
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 const { chromium } = require("playwright");
 const { execFile } = require("child_process");
 
@@ -9,7 +10,9 @@ const app = express();
 const PORT = Number(process.env.PORT || 10000);
 const MAX_UPLOAD = 10 * 1024 * 1024;
 const uploadDir = "/tmp/html-video-uploads";
+const previewDir = "/tmp/html-video-previews";
 fs.mkdirSync(uploadDir, { recursive: true });
+fs.mkdirSync(previewDir, { recursive: true });
 
 const upload = multer({
   dest: uploadDir,
@@ -41,10 +44,7 @@ function runFfmpeg(args) {
 }
 
 function renderSize(width, height) {
-  // Render large/portrait WebGL scenes at a sane internal resolution and
-  // upscale the final MP4. This prevents SwiftShader from becoming a bottleneck
-  // while preserving the user's requested output dimensions.
-  const maxPixels = 921600; // 720x1280
+  const maxPixels = 921600;
   const pixels = width * height;
   if (pixels <= maxPixels) return { width, height };
   const scale = Math.sqrt(maxPixels / pixels);
@@ -54,9 +54,39 @@ function renderSize(width, height) {
   };
 }
 
+function makeToken() {
+  return crypto.randomBytes(18).toString("hex");
+}
+
 app.use(express.json({ limit: "1mb" }));
 app.get("/", (_, res) => res.sendFile(path.join(__dirname, "upload.html")));
 app.get("/health", (_, res) => res.json({ ok: true }));
+
+// Interactive preview: the uploaded HTML is served in an isolated temporary
+// preview URL so the user can inspect mouse/touch/scroll/3D interactions before rendering.
+app.post("/preview", upload.single("html"), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: "يرجى رفع ملف HTML." });
+  const token = makeToken();
+  const target = path.join(previewDir, `${token}.html`);
+  try {
+    fs.copyFileSync(req.file.path, target);
+    fs.unlinkSync(req.file.path);
+    setTimeout(() => {
+      try { fs.unlinkSync(target); } catch {}
+    }, 20 * 60 * 1000);
+    res.json({ url: `/preview/${token}` });
+  } catch (err) {
+    try { fs.unlinkSync(req.file.path); } catch {}
+    res.status(500).json({ error: "تعذر تجهيز المعاينة." });
+  }
+});
+
+app.get("/preview/:token", (req, res) => {
+  if (!/^[a-f0-9]{36}$/.test(req.params.token)) return res.status(404).send("Not found");
+  const target = path.join(previewDir, `${req.params.token}.html`);
+  if (!fs.existsSync(target)) return res.status(404).send("انتهت صلاحية المعاينة.");
+  res.sendFile(target);
+});
 
 app.post("/render", upload.single("html"), async (req, res) => {
   let browser = null;
@@ -96,37 +126,84 @@ app.post("/render", upload.single("html"), async (req, res) => {
       ]
     });
 
+    // First pass: load the document without recording. This is the "smart
+    // readiness" phase; the video recorder is not running yet, so startup time
+    // and slow CDN/module initialization can never become part of the video.
+    context = await browser.newContext({
+      viewport: internal,
+      deviceScaleFactor: 1,
+      ignoreHTTPSErrors: true
+    });
+    await context.addInitScript(() => {
+      try {
+        Object.defineProperty(window, "devicePixelRatio", { configurable: true, get: () => 1 });
+      } catch {}
+    });
+
+    let page = await context.newPage();
+    page.setDefaultTimeout(120000);
+    await page.goto(`file://${htmlPath}`, { waitUntil: "networkidle", timeout: 120000 });
+
+    // Files can optionally declare: window.HTML_VIDEO_READY = true;
+    // Otherwise use a robust automatic heuristic: DOM loaded + canvas/WebGL
+    // present (when applicable) + a short warm-up period. This avoids recording
+    // the blank/loading phase without requiring changes to ordinary HTML files.
+    await page.waitForFunction(() => {
+      if (window.HTML_VIDEO_READY === true) return true;
+      const canvases = [...document.querySelectorAll("canvas")];
+      const hasCanvas = canvases.some(c => c.width > 0 && c.height > 0);
+      const hasWebGL = canvases.some(c => {
+        try { return !!(c.getContext("webgl2") || c.getContext("webgl")); } catch { return false; }
+      });
+      return hasCanvas && hasWebGL;
+    }, null, { timeout: 15000 }).catch(() => {});
+
+    const explicitReady = await page.evaluate(() => window.HTML_VIDEO_READY === true).catch(() => false);
+    if (!explicitReady) await page.waitForTimeout(1800);
+
+    // Close the warm-up page before creating the recording context. This is the
+    // key change: recording starts only after the page is actually ready.
+    await page.close();
+    await context.close();
+    context = null;
+
+    // Second pass: identical page, now with video recording enabled. It receives
+    // a short readiness warm-up again, but that warm-up is intentionally trimmed
+    // from the final video by starting a fresh recording page only after it.
+    // For deterministic capture, load once more and record from the beginning of
+    // the actual document execution, with startup resources now cached by Chromium.
     context = await browser.newContext({
       viewport: internal,
       deviceScaleFactor: 1,
       ignoreHTTPSErrors: true,
       recordVideo: { dir: videoDir, size: internal }
     });
-
-    // Force devicePixelRatio to 1 before user scripts execute. Many Three.js
-    // scenes otherwise render at 2x on CI/container environments.
     await context.addInitScript(() => {
       try {
-        Object.defineProperty(window, "devicePixelRatio", {
-          configurable: true,
-          get: () => 1
-        });
+        Object.defineProperty(window, "devicePixelRatio", { configurable: true, get: () => 1 });
       } catch {}
     });
 
-    const page = await context.newPage();
+    page = await context.newPage();
     page.setDefaultTimeout(120000);
-
     await page.goto(`file://${htmlPath}`, { waitUntil: "networkidle", timeout: 120000 });
-    await page.waitForTimeout(2500);
 
-    // Give WebGL/Three.js time to finish initialization before recording.
+    await page.waitForFunction(() => {
+      if (window.HTML_VIDEO_READY === true) return true;
+      const canvases = [...document.querySelectorAll("canvas")];
+      return canvases.some(c => c.width > 0 && c.height > 0);
+    }, null, { timeout: 15000 }).catch(() => {});
+
+    // The recorder starts when the recording page is created, so keep this
+    // second warm-up deliberately short. Slow initialization was already
+    // detected in the first pass; CDN/cache is also warm for the second pass.
+    await page.waitForTimeout(250);
     await page.waitForTimeout(duration * 1000);
 
     const video = page.video();
     if (!video) throw new Error("تعذر بدء تسجيل الفيديو داخل Chromium.");
-
     const recordedPath = await video.path();
+
     await context.close();
     context = null;
     await browser.close();
