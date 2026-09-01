@@ -40,6 +40,20 @@ function runFfmpeg(args) {
   });
 }
 
+function renderSize(width, height) {
+  // Render large/portrait WebGL scenes at a sane internal resolution and
+  // upscale the final MP4. This prevents SwiftShader from becoming a bottleneck
+  // while preserving the user's requested output dimensions.
+  const maxPixels = 921600; // 720x1280
+  const pixels = width * height;
+  if (pixels <= maxPixels) return { width, height };
+  const scale = Math.sqrt(maxPixels / pixels);
+  return {
+    width: Math.max(320, Math.floor(width * scale)),
+    height: Math.max(320, Math.floor(height * scale))
+  };
+}
+
 app.use(express.json({ limit: "1mb" }));
 app.get("/", (_, res) => res.sendFile(path.join(__dirname, "upload.html")));
 app.get("/health", (_, res) => res.json({ ok: true }));
@@ -56,6 +70,7 @@ app.post("/render", upload.single("html"), async (req, res) => {
     const width = Math.round(safeNumber(req.body.width, 1080, 320, 1920));
     const height = Math.round(safeNumber(req.body.height, 1920, 320, 1920));
     const fps = Math.round(safeNumber(req.body.fps, 30, 15, 30));
+    const internal = renderSize(width, height);
 
     const job = `job-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     work = path.join("/tmp", job);
@@ -74,27 +89,38 @@ app.post("/render", upload.single("html"), async (req, res) => {
         "--use-gl=swiftshader",
         "--enable-webgl",
         "--ignore-gpu-blocklist",
-        "--disable-gpu-sandbox"
+        "--disable-gpu-sandbox",
+        "--disable-background-timer-throttling",
+        "--disable-renderer-backgrounding",
+        "--disable-backgrounding-occluded-windows"
       ]
     });
 
-    // Record Chromium's actual rendered output instead of taking hundreds of
-    // full-page PNG screenshots. This avoids screenshot deadlocks with WebGL.
     context = await browser.newContext({
-      viewport: { width, height },
+      viewport: internal,
       deviceScaleFactor: 1,
       ignoreHTTPSErrors: true,
-      recordVideo: { dir: videoDir, size: { width, height } }
+      recordVideo: { dir: videoDir, size: internal }
+    });
+
+    // Force devicePixelRatio to 1 before user scripts execute. Many Three.js
+    // scenes otherwise render at 2x on CI/container environments.
+    await context.addInitScript(() => {
+      try {
+        Object.defineProperty(window, "devicePixelRatio", {
+          configurable: true,
+          get: () => 1
+        });
+      } catch {}
     });
 
     const page = await context.newPage();
     page.setDefaultTimeout(120000);
 
     await page.goto(`file://${htmlPath}`, { waitUntil: "networkidle", timeout: 120000 });
-    await page.waitForTimeout(1500);
+    await page.waitForTimeout(2500);
 
-    // Start recording only after the page and remote assets have settled.
-    // Keep a little buffer so the requested duration is not clipped at the end.
+    // Give WebGL/Three.js time to finish initialization before recording.
     await page.waitForTimeout(duration * 1000);
 
     const video = page.video();
