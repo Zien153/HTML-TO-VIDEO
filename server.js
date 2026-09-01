@@ -53,18 +53,6 @@ async function launchBrowser() {
     args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--use-gl=swiftshader", "--enable-webgl", "--ignore-gpu-blocklist", "--disable-gpu-sandbox", "--disable-background-timer-throttling", "--disable-renderer-backgrounding", "--disable-backgrounding-occluded-windows"]
   });
 }
-async function newContext(browser, internal, recordVideo, videoDir) {
-  const context = await browser.newContext({
-    viewport: internal,
-    deviceScaleFactor: 1,
-    ignoreHTTPSErrors: true,
-    ...(recordVideo ? { recordVideo: { dir: videoDir, size: internal } } : {})
-  });
-  await context.addInitScript(() => {
-    try { Object.defineProperty(window, "devicePixelRatio", { configurable: true, get: () => 1 }); } catch {}
-  });
-  return context;
-}
 
 app.use(express.json({ limit: "1mb" }));
 app.get("/", (_, res) => res.sendFile(path.join(__dirname, "upload.html")));
@@ -101,79 +89,76 @@ app.post("/render", upload.single("html"), async (req, res) => {
     const internal = renderSize(width, height);
     const job = `job-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     work = path.join("/tmp", job);
-    const videoDir = path.join(work, "video");
-    fs.mkdirSync(videoDir, { recursive: true });
+    const framesDir = path.join(work, "frames");
+    fs.mkdirSync(framesDir, { recursive: true });
     const htmlPath = path.join(work, "index.html");
     fs.copyFileSync(req.file.path, htmlPath);
 
     browser = await launchBrowser();
-
-    // One page only. The recorder is created immediately, but we pause the
-    // recording timeline using MediaRecorder until the document announces that
-    // it is ready. For ordinary HTML, an automatic visual-readiness detector is
-    // used as fallback.
-    context = await newContext(browser, internal, true, videoDir);
+    context = await browser.newContext({ viewport: internal, deviceScaleFactor: 1, ignoreHTTPSErrors: true });
     page = await context.newPage();
     page.setDefaultTimeout(120000);
-    await page.addInitScript(() => {
-      (() => {
-        const OriginalMediaRecorder = window.MediaRecorder;
-        if (!OriginalMediaRecorder) return;
-        window.__htmlVideoRecordingStarted = false;
-        window.__htmlVideoOriginalMediaRecorder = OriginalMediaRecorder;
-        // Expose a signal only; the actual Chromium recorder remains stable.
-        window.HTML_VIDEO_CAPTURE_START = () => { window.__htmlVideoRecordingStarted = true; };
-      })();
-    });
 
-    const recordingCreatedAt = Date.now();
+    // Keep the HTML running continuously. We deliberately avoid Playwright's
+    // recordVideo: it records startup frames and can create a large intermediate
+    // WebM for heavy Three.js scenes. Instead, after readiness we capture only
+    // the requested frames and feed those frames to FFmpeg.
     await page.goto(`file://${htmlPath}`, { waitUntil: "networkidle", timeout: 120000 });
 
-    // Wait for explicit readiness when supplied. Otherwise wait until the DOM
-    // is complete and either a WebGL/canvas has painted or a normal page has
-    // settled, then require several consecutive stable checks.
-    await page.waitForFunction(() => {
-      if (window.HTML_VIDEO_READY === true) return true;
-      if (document.readyState !== "complete") return false;
-      const canvases = [...document.querySelectorAll("canvas")];
-      if (!canvases.length) return true;
-      return canvases.some(c => c.width > 0 && c.height > 0);
-    }, null, { timeout: 20000 }).catch(() => {});
+    const hasCanvas = await page.locator("canvas").count();
+    if (hasCanvas) {
+      await page.waitForFunction(() => {
+        if (window.HTML_VIDEO_READY === true) return true;
+        if (document.readyState !== "complete") return false;
+        return [...document.querySelectorAll("canvas")].some(c => c.width > 0 && c.height > 0);
+      }, null, { timeout: 30000 }).catch(() => {});
 
-    const explicit = await page.evaluate(() => window.HTML_VIDEO_READY === true).catch(() => false);
-    if (explicit) {
-      await page.waitForFunction(() => window.HTML_VIDEO_READY === true, null, { timeout: 5000 }).catch(() => {});
+      const explicit = await page.evaluate(() => window.HTML_VIDEO_READY === true).catch(() => false);
+      if (!explicit) {
+        // Wait for the scene to paint and stabilize before frame 0. The stability
+        // check samples the canvas size and DOM mutation count over consecutive
+        // animation frames; it does not require the animation itself to stop.
+        await page.evaluate(async () => {
+          const start = performance.now();
+          let stable = 0;
+          let last = `${document.querySelectorAll("canvas").length}:${innerWidth}:${innerHeight}`;
+          while (performance.now() - start < 12000) {
+            await new Promise(requestAnimationFrame);
+            const current = `${document.querySelectorAll("canvas").length}:${innerWidth}:${innerHeight}`;
+            if (current === last) stable++; else stable = 0;
+            last = current;
+            if (stable >= 12) break;
+          }
+        });
+      }
     } else {
-      // Let the first rendered scene settle. This is intentionally shorter than
-      // the old 1.8s fixed delay and avoids capturing obvious startup frames.
-      await page.waitForTimeout(900);
+      await page.waitForFunction(() => document.readyState === "complete", null, { timeout: 30000 }).catch(() => {});
+      await page.waitForTimeout(500);
     }
 
-    // Chromium's recordVideo starts at page creation. Determine the actual
-    // readiness offset from navigation timing and trim exactly that prefix from
-    // the recorded WebM. Crucially, we do NOT reload the HTML a second time.
-    const readyOffset = await page.evaluate(() => {
-      const nav = performance.getEntriesByType("navigation")[0];
-      return nav ? performance.now() / 1000 : 0;
-    }).catch(() => 0);
-    const elapsedSinceRecorder = Math.max(0, (Date.now() - recordingCreatedAt) / 1000);
-    const trimOffset = Math.max(0, Math.min(30, Math.max(readyOffset, elapsedSinceRecorder - 0.15)));
+    // Give explicit-ready pages one paint cycle after signalling readiness.
+    await page.evaluate(() => new Promise(requestAnimationFrame));
 
-    // Record exactly the requested amount after readiness.
-    await page.waitForTimeout(duration * 1000);
-    const video = page.video();
-    if (!video) throw new Error("تعذر بدء تسجيل الفيديو داخل Chromium.");
-    const recordedPath = await video.path();
+    const frames = Math.ceil(duration * fps);
+    const framePattern = path.join(framesDir, "frame-%06d.png");
+    for (let i = 0; i < frames; i++) {
+      await page.screenshot({ path: path.join(framesDir, `frame-${String(i).padStart(6, "0")}.png`), type: "png", animations: "allow", timeout: 120000 });
+      // Use a deterministic capture cadence. A tiny delay prevents Chromium
+      // from starving its WebGL animation loop while still keeping capture close
+      // to the requested FPS.
+      if (i + 1 < frames) await page.waitForTimeout(1000 / fps);
+    }
 
     await context.close(); context = null;
     await browser.close(); browser = null;
 
     const out = path.join(work, "html-render.mp4");
     await runFfmpeg([
-      "-y", "-ss", String(trimOffset), "-i", recordedPath, "-t", String(duration),
-      "-vf", `fps=${fps},scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,format=yuv420p`,
-      "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-movflags", "+faststart", out
+      "-y", "-framerate", String(fps), "-i", framePattern,
+      "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+      "-pix_fmt", "yuv420p", "-movflags", "+faststart", out
     ]);
+
     res.download(out, "html-render.mp4", err => {
       cleanup(work, req.file.path);
       if (err) console.error("Download error:", err.message);
