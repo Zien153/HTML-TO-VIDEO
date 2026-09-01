@@ -1,36 +1,36 @@
 <!doctype html>
 <html lang="ar" dir="rtl">
 <head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>HTML إلى فيديو</title>
 <style>
-body{font-family:Arial,sans-serif;background:#f6f1f4;margin:0;min-height:100vh;display:grid;place-items:center;color:#4b2637}
-.card{width:min(92vw,620px);background:#fff;padding:32px;border-radius:24px;box-shadow:0 18px 60px #0001}
-h1{margin-top:0}.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-label{display:block;margin:12px 0 6px;font-size:14px}input{width:100%;padding:12px;border:1px solid #ddd;border-radius:10px}
-button{margin-top:20px;width:100%;padding:14px;border:0;border-radius:12px;background:#a72d5f;color:white;font-size:16px;cursor:pointer}
-#status{margin-top:16px;white-space:pre-wrap}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;font-family:Tahoma,Arial,sans-serif;background:radial-gradient(circle at top,#fff,#f4eaf0 55%,#e4d5de);color:#442536;display:grid;place-items:center;padding:24px}.card{width:min(94vw,760px);background:rgba(255,255,255,.86);backdrop-filter:blur(18px);padding:38px;border:1px solid #fff;border-radius:30px;box-shadow:0 25px 80px #6b315122}h1{margin:0 0 8px;font-size:clamp(28px,5vw,46px);color:#8d2453}p{color:#76586a;margin:0 0 28px}.drop{border:2px dashed #d28baa;border-radius:20px;padding:34px;text-align:center;background:#fff8fb;cursor:pointer}.drop:hover{background:#fff2f7}.drop strong{display:block;font-size:19px;margin-bottom:8px}.drop small{color:#947182}input[type=file]{display:none}.row{display:grid;grid-template-columns:repeat(2,1fr);gap:14px;margin-top:18px}.field label{display:block;font-size:13px;margin:0 0 7px;color:#765064}.field input{width:100%;padding:13px;border:1px solid #dfc9d4;border-radius:12px;background:#fff;font-size:15px}.presets{display:flex;gap:8px;flex-wrap:wrap;margin-top:18px}.preset{border:1px solid #dec3d0;background:#fff;border-radius:999px;padding:8px 13px;cursor:pointer;color:#713c55}.preset:hover{background:#faeaf1}.submit{width:100%;margin-top:22px;padding:16px;border:0;border-radius:14px;background:linear-gradient(135deg,#a82e61,#d45282);color:#fff;font-size:17px;font-weight:bold;cursor:pointer;box-shadow:0 10px 25px #a82e6130}.submit:disabled{opacity:.55;cursor:not-allowed}.status{display:none;margin-top:18px;padding:14px;border-radius:14px;background:#f8eef3;text-align:center;white-space:pre-wrap}.progress{height:8px;background:#eadde4;border-radius:99px;overflow:hidden;margin-top:12px}.bar{height:100%;width:0;background:#bd3e70;transition:width .25s}#name{margin-top:10px;color:#8e5470;font-size:13px}@media(max-width:600px){.card{padding:24px}.row{grid-template-columns:1fr}}
 </style>
 </head>
-<body><main class="card">
-<h1>تحويل HTML إلى فيديو 🎥</h1>
-<p>ارفع ملف HTML وسيتم تشغيله في Chromium وتصديره كـ MP4.</p>
-<form id="f">
-<label>ملف HTML</label><input type="file" name="html" accept=".html,text/html" required>
+<body>
+<main class="card">
+<h1>حوّل HTML إلى فيديو 🎬</h1>
+<p>ارفع أي صفحة HTML متحركة وسيتم تشغيلها في Chromium وتحويلها إلى ملف MP4 جاهز.</p>
+<form id="form">
+<label class="drop" for="html"><strong>📁 اختر ملف HTML</strong><small>يدعم .html و .htm — الحد الأقصى 10 MB</small><div id="name"></div></label>
+<input id="html" type="file" name="html" accept=".html,.htm,text/html" required>
 <div class="row">
-<div><label>المدة (ثانية)</label><input name="duration" type="number" value="10" min="3" max="30"></div>
-<div><label>FPS</label><input name="fps" type="number" value="30" min="15" max="30"></div>
+<div class="field"><label>المدة بالثواني (3–30)</label><input name="duration" type="number" value="10" min="3" max="30" step="1"></div>
+<div class="field"><label>معدل الإطارات FPS</label><input name="fps" type="number" value="30" min="15" max="30" step="1"></div>
+<div class="field"><label>العرض</label><input id="width" name="width" type="number" value="1080" min="320" max="1920"></div>
+<div class="field"><label>الارتفاع</label><input id="height" name="height" type="number" value="1920" min="320" max="1920"></div>
 </div>
-<div class="row">
-<div><label>العرض</label><input name="width" type="number" value="1080"></div>
-<div><label>الارتفاع</label><input name="height" type="number" value="1920"></div>
-</div>
-<button>إنشاء الفيديو</button><div id="status"></div>
+<div class="presets"><button class="preset" type="button" data-w="1080" data-h="1920">📱 Reels / TikTok</button><button class="preset" type="button" data-w="1920" data-h="1080">🖥️ أفقي</button><button class="preset" type="button" data-w="1080" data-h="1080">⬜ مربع</button></div>
+<button class="submit" id="submit">إنشاء الفيديو</button>
+<div class="status" id="status"><span id="statusText"></span><div class="progress"><div class="bar" id="bar"></div></div></div>
 </form>
+</main>
 <script>
-f.onsubmit=async e=>{e.preventDefault();status.textContent="جاري إنشاء الفيديو... قد يستغرق عدة دقائق.";
-const r=await fetch("/render",{method:"POST",body:new FormData(f)});
-if(r.ok){const b=await r.blob(),a=document.createElement("a");a.href=URL.createObjectURL(b);a.download="html-render.mp4";a.click();status.textContent="تم إنشاء الفيديو."}
-else{status.textContent="حدث خطأ: "+await r.text()}}
+const form=document.getElementById('form'),file=document.getElementById('html'),nameEl=document.getElementById('name'),submit=document.getElementById('submit'),status=document.getElementById('status'),statusText=document.getElementById('statusText'),bar=document.getElementById('bar');
+file.addEventListener('change',()=>{nameEl.textContent=file.files[0]?`✓ ${file.files[0].name}`:''});
+document.querySelectorAll('.preset').forEach(b=>b.onclick=()=>{document.getElementById('width').value=b.dataset.w;document.getElementById('height').value=b.dataset.h});
+form.onsubmit=async e=>{e.preventDefault();if(!file.files[0])return;submit.disabled=true;status.style.display='block';statusText.textContent='جاري تجهيز الصفحة...';bar.style.width='8%';try{const r=await fetch('/render',{method:'POST',body:new FormData(form)});bar.style.width='85%';if(!r.ok){let msg='فشل إنشاء الفيديو.';try{msg=(await r.json()).error||msg}catch{}throw new Error(msg)}statusText.textContent='جاري تنزيل الفيديو...';const blob=await r.blob();bar.style.width='100%';const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='html-render.mp4';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(a.href),60000);statusText.textContent='✓ تم إنشاء الفيديو بنجاح';}catch(err){bar.style.width='0';statusText.textContent='❌ '+err.message;}finally{submit.disabled=false}};
 </script>
-</main></body></html>
+</body>
+</html>
