@@ -46,6 +46,7 @@ app.get("/health", (_, res) => res.json({ ok: true }));
 
 app.post("/render", upload.single("html"), async (req, res) => {
   let browser = null;
+  let context = null;
   let work = null;
 
   try {
@@ -58,7 +59,8 @@ app.post("/render", upload.single("html"), async (req, res) => {
 
     const job = `job-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     work = path.join("/tmp", job);
-    fs.mkdirSync(work, { recursive: true });
+    const videoDir = path.join(work, "video");
+    fs.mkdirSync(videoDir, { recursive: true });
 
     const htmlPath = path.join(work, "index.html");
     fs.copyFileSync(req.file.path, htmlPath);
@@ -71,41 +73,49 @@ app.post("/render", upload.single("html"), async (req, res) => {
         "--disable-dev-shm-usage",
         "--use-gl=swiftshader",
         "--enable-webgl",
-        "--ignore-gpu-blocklist"
+        "--ignore-gpu-blocklist",
+        "--disable-gpu-sandbox"
       ]
     });
 
-    const context = await browser.newContext({
+    // Record Chromium's actual rendered output instead of taking hundreds of
+    // full-page PNG screenshots. This avoids screenshot deadlocks with WebGL.
+    context = await browser.newContext({
       viewport: { width, height },
       deviceScaleFactor: 1,
-      ignoreHTTPSErrors: true
+      ignoreHTTPSErrors: true,
+      recordVideo: { dir: videoDir, size: { width, height } }
     });
+
     const page = await context.newPage();
     page.setDefaultTimeout(120000);
 
     await page.goto(`file://${htmlPath}`, { waitUntil: "networkidle", timeout: 120000 });
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(1500);
 
-    const frames = Math.ceil(duration * fps);
-    for (let i = 0; i < frames; i++) {
-      const filename = path.join(work, `frame-${String(i).padStart(6, "0")}.png`);
-      await page.screenshot({
-        path: filename,
-        animations: "allow",
-        timeout: 120000,
-        type: "png"
-      });
-      if (i < frames - 1) await page.waitForTimeout(1000 / fps);
-    }
+    // Start recording only after the page and remote assets have settled.
+    // Keep a little buffer so the requested duration is not clipped at the end.
+    await page.waitForTimeout(duration * 1000);
 
+    const video = page.video();
+    if (!video) throw new Error("تعذر بدء تسجيل الفيديو داخل Chromium.");
+
+    const recordedPath = await video.path();
+    await context.close();
+    context = null;
     await browser.close();
     browser = null;
 
     const out = path.join(work, "html-render.mp4");
     await runFfmpeg([
-      "-y", "-framerate", String(fps), "-i", path.join(work, "frame-%06d.png"),
-      "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-      "-pix_fmt", "yuv420p", "-movflags", "+faststart", out
+      "-y",
+      "-i", recordedPath,
+      "-vf", `fps=${fps},scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,format=yuv420p`,
+      "-c:v", "libx264",
+      "-preset", "veryfast",
+      "-crf", "20",
+      "-movflags", "+faststart",
+      out
     ]);
 
     res.download(out, "html-render.mp4", (err) => {
@@ -113,6 +123,7 @@ app.post("/render", upload.single("html"), async (req, res) => {
       if (err) console.error("Download error:", err.message);
     });
   } catch (err) {
+    if (context) await context.close().catch(() => {});
     if (browser) await browser.close().catch(() => {});
     cleanup(work, req.file?.path);
     console.error("Render error:", err);
