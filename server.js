@@ -65,7 +65,14 @@ app.post("/render", upload.single("html"), async (req, res) => {
 
     browser = await chromium.launch({
       headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox", "--use-gl=swiftshader", "--enable-webgl", "--ignore-gpu-blocklist"]
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--use-gl=swiftshader",
+        "--enable-webgl",
+        "--ignore-gpu-blocklist"
+      ]
     });
 
     const context = await browser.newContext({
@@ -74,14 +81,20 @@ app.post("/render", upload.single("html"), async (req, res) => {
       ignoreHTTPSErrors: true
     });
     const page = await context.newPage();
+    page.setDefaultTimeout(120000);
 
-    await page.goto(`file://${htmlPath}`, { waitUntil: "networkidle", timeout: 60000 });
+    await page.goto(`file://${htmlPath}`, { waitUntil: "networkidle", timeout: 120000 });
     await page.waitForTimeout(2000);
 
     const frames = Math.ceil(duration * fps);
     for (let i = 0; i < frames; i++) {
       const filename = path.join(work, `frame-${String(i).padStart(6, "0")}.png`);
-      await page.screenshot({ path: filename, animations: "allow" });
+      await page.screenshot({
+        path: filename,
+        animations: "allow",
+        timeout: 120000,
+        type: "png"
+      });
       if (i < frames - 1) await page.waitForTimeout(1000 / fps);
     }
 
