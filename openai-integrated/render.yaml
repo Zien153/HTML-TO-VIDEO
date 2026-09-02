@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: html-to-video-openai
+    runtime: docker
+    dockerfilePath: ./openai-integrated/Dockerfile
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-5.6-luna
+      - key: OPENAI_MAX_OUTPUT_TOKENS
+        value: "8000"
